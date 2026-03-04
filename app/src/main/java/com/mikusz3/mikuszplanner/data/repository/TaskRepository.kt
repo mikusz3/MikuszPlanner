@@ -11,6 +11,45 @@ import com.mikusz3.mikuszplanner.data.model.Task
 import com.mikusz3.mikuszplanner.data.model.TaskWithSubTasks
 import kotlinx.coroutines.flow.Flow
 
+private data class DeepSeekErrorEnvelope(
+    val error: DeepSeekError? = null
+)
+
+private data class DeepSeekError(
+    val message: String? = null,
+    val type: String? = null
+)
+
+internal fun normalizeDeepSeekApiKey(rawKey: String): String {
+    return rawKey
+        .trim()
+        .removeSurrounding("\"")
+        .removeSurrounding("'")
+        .replace(Regex("^Authorization\\s*:\\s*", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("^Bearer\\s+", RegexOption.IGNORE_CASE), "")
+        .trim()
+}
+
+internal fun formatDeepSeekApiError(httpCode: Int, rawBody: String?): String {
+    val parsed = rawBody
+        ?.takeIf { it.isNotBlank() }
+        ?.let { runCatching { Gson().fromJson(it, DeepSeekErrorEnvelope::class.java) }.getOrNull() }
+        ?.error
+
+    val type = parsed?.type?.trim()
+    val message = parsed?.message?.trim()
+
+    if (type.equals("authentication_error", ignoreCase = true) || httpCode == 401) {
+        return "DeepSeek authentication failed. Check your API key in Appearance > DeepSeek API Key."
+    }
+
+    if (!message.isNullOrBlank()) {
+        return "DeepSeek API error: $message"
+    }
+
+    return "DeepSeek API request failed (HTTP $httpCode)."
+}
+
 class TaskRepository(private val taskDao: TaskDao) {
 
     fun getAllTasksWithSubTasks(): Flow<List<TaskWithSubTasks>> =
@@ -30,6 +69,13 @@ class TaskRepository(private val taskDao: TaskDao) {
 
     suspend fun generateSubTasksWithAI(apiKey: String, mainTaskTitle: String): Result<List<String>> {
         return try {
+            val normalizedApiKey = normalizeDeepSeekApiKey(apiKey)
+            if (normalizedApiKey.isBlank()) {
+                return Result.failure(
+                    Exception("No API key set. Add your DeepSeek API key in Settings.")
+                )
+            }
+
             val prompt = """Given the main task: "$mainTaskTitle", generate 3 to 5 specific, actionable sub-tasks that help complete it step by step.
 Return ONLY a valid JSON array of strings, no explanations, no markdown. Example: ["Step one", "Step two", "Step three"]"""
 
@@ -44,7 +90,7 @@ Return ONLY a valid JSON array of strings, no explanations, no markdown. Example
             )
 
             val response = DeepSeekClient.service.generateSubTasks(
-                authorization = "Bearer $apiKey",
+                authorization = "Bearer $normalizedApiKey",
                 request = request
             )
 
@@ -63,8 +109,14 @@ Return ONLY a valid JSON array of strings, no explanations, no markdown. Example
                 val titles: List<String> = Gson().fromJson(jsonArray, type)
                 Result.success(titles)
             } else {
-                val errorMsg = response.errorBody()?.string() ?: "HTTP ${response.code()}"
-                Result.failure(Exception("API error: $errorMsg"))
+                Result.failure(
+                    Exception(
+                        formatDeepSeekApiError(
+                            httpCode = response.code(),
+                            rawBody = response.errorBody()?.string()
+                        )
+                    )
+                )
             }
         } catch (e: Exception) {
             Result.failure(e)
